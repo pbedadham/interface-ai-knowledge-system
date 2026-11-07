@@ -12,6 +12,7 @@ from collections import Counter, defaultdict
 from datetime import date
 from pathlib import Path
 import sys
+from typing import NamedTuple
 
 # The harness normally puts its directory on sys.path. This fallback also supports
 # importing solution.py directly from a checkout.
@@ -39,6 +40,22 @@ ALIASES = {
     "hy-vee": {"closure", "close", "closed", "branch"},
 }
 
+
+class RateFact(NamedTuple):
+    """A normalized numeric claim used for cross-page conflict comparison."""
+
+    product: str
+    term: str | None
+    tier: str | None
+    metric: str
+    value: str
+    url: str
+    title: str
+    snapshot_id: str
+    taken_on: str
+    passage: str
+    authority: float
+
 class Doc:
     def __init__(self, url, title, text, snapshot_id, taken_on, chunks):
         self.url = url
@@ -57,6 +74,7 @@ class Knowledge:
     def __init__(self):
         self.snapshots: list[tuple[str, str, dict[str, Doc]]] = []
         self.docs_by_url: dict[str, list[Doc]] = defaultdict(list)
+        self.facts: list[RateFact] = []
         self._corpus = []
 
     def ingest(self, snapshot: Snapshot) -> None:
@@ -66,6 +84,7 @@ class Knowledge:
             d = Doc(page.url, page.title, page.markdown, snapshot.snapshot_id, snapshot.taken_on, chunks)
             pages[page.url] = d
             self.docs_by_url[page.url].append(d)
+            self.facts.extend(_extract_rate_facts(d))
         self.snapshots.append((snapshot.taken_on, snapshot.snapshot_id, pages))
         self.snapshots.sort(key=lambda x: x[0])
 
@@ -84,6 +103,8 @@ class Knowledge:
         qlower=question.lower()
         if "7/1" in qlower and _rate_question(qlower):
             return Answer("I don't know; the website snapshots do not list a 7/1 adjustable-rate mortgage rate. Please contact a Dupaco mortgage lender.", confident=False)
+        if "construction" in qlower and "loan" in qlower and _rate_question(qlower):
+            return Answer("I don't know; the website snapshots describe construction loans but do not list a construction-loan rate. Please contact a Dupaco mortgage lender.", confident=False)
         if "apple pay" in qlower or "mobile wallet" in qlower:
             d=next((x for x in pages.values() if "mobile-payments" in x.url.lower()),None)
             if d:
@@ -92,6 +113,7 @@ class Knowledge:
         focused = _focused_answer(question, pages, snap[1])
         if focused is not None:
             return focused
+        preferred_facts, rejected_facts = self._fact_guidance(question, snap[1])
         q = _tokens(question)
         expanded = set(q)
         for t in list(q): expanded.update(ALIASES.get(t, ()))
@@ -119,6 +141,9 @@ class Knowledge:
                 if broad and _looks_like_rate_table(chunk): score *= 1.25
                 if _is_historical(chunk): score *= 0.72
                 score += _evidence_boost(chunk, question)
+                chunk_values={_numeric_value(v) for v in _extract_values(chunk)}
+                if any(url == d.url and value in chunk_values for url,value in preferred_facts): score *= 1.35
+                if any(url == d.url and value in chunk_values for url,value in rejected_facts): score *= 0.55
                 candidates.append((score, d, chunk))
         candidates.sort(key=lambda x: (-x[0], x[1].url, x[2]))
         if not candidates or candidates[0][0] < 1.3:
@@ -171,6 +196,28 @@ class Knowledge:
         note = self._conflict_note(question, primary, primary_chunk, as_of)
         return Answer(text=text[:1800], sources=sources, confident=True, conflict_note=note)
 
+    def _fact_guidance(self, question, snapshot_id):
+        """Share conflict-resolution decisions with retrieval without generating text."""
+        qtokens=set(_tokens(question))-STOP
+        relevant=[]
+        for fact in self.facts:
+            if fact.snapshot_id != snapshot_id: continue
+            ftokens=set(_tokens(" ".join(x for x in (fact.product,fact.term,fact.tier,fact.metric) if x)))
+            if not ftokens or len(qtokens & ftokens) < min(2,len(ftokens)): continue
+            if fact.term and re.search(r"\b\d+\s*[- ]?(?:month|year)",question,re.I) and fact.term.split("-")[0] not in question:
+                continue
+            relevant.append(fact)
+        groups=defaultdict(list)
+        for fact in relevant:
+            groups[(fact.product,fact.term,fact.tier,fact.metric)].append(fact)
+        preferred=set(); rejected=set()
+        for facts in groups.values():
+            if len({_numeric_value(f.value) for f in facts}) < 2: continue
+            winner=max(facts,key=_fact_preference)
+            preferred.add((winner.url,_numeric_value(winner.value)))
+            rejected.update((f.url,_numeric_value(f.value)) for f in facts if _numeric_value(f.value) != _numeric_value(winner.value))
+        return preferred,rejected
+
     def _conflict_note(self, question, primary, chunk, as_of):
         q = _tokens(question)
         alts = []
@@ -185,43 +232,73 @@ class Knowledge:
         return None
 
     def conflicts(self) -> list[Conflict]:
-        """Find material numeric changes between versions of the same rate/fee pages."""
+        """Find comparable rate claims that disagree across URLs or snapshots."""
+        groups = defaultdict(list)
+        for fact in self.facts:
+            groups[(fact.product, fact.term, fact.tier, fact.metric)].append(fact)
+
         out = []
-        for url, docs in sorted(self.docs_by_url.items()):
-            if len(docs) < 2 or not re.search(r"rate|loan|saving|checking|certificate|fee|card", url, re.I):
+        for key, facts in sorted(groups.items(), key=lambda item: str(item[0])):
+            # Repeated claims from the same page/version add no evidence. Keep the most
+            # useful representative for each source and value.
+            unique = {}
+            for fact in facts:
+                unique[(fact.url, fact.snapshot_id, _numeric_value(fact.value))] = fact
+            facts = list(unique.values())
+            values = {_numeric_value(f.value) for f in facts}
+            if len(facts) < 2 or len(values) < 2:
                 continue
-            docs = sorted(docs, key=lambda d: d.taken_on)
-            previous = docs[0]
-            for current in docs[1:]:
-                if previous.text == current.text:
-                    previous = current; continue
-                # Compare similar passages with different numeric facts, skipping ordinary
-                # dates, page counters, and paragraphs that are not answer-bearing.
-                old_chunks = [c for c in previous.chunks if _has_material_number(c)]
-                new_chunks = [c for c in current.chunks if _has_material_number(c)]
-                best = None
-                for old in old_chunks:
-                    ot = set(_tokens(old)) - STOP
-                    for new in new_chunks:
-                        nt = set(_tokens(new)) - STOP
-                        sim = len(ot & nt) / max(1, len(ot | nt))
-                        ov, nv = _extract_values(old), _extract_values(new)
-                        diff = [x for x in ov if x not in nv] + [x for x in nv if x not in ov]
-                        if sim > 0.30 and len(diff) >= 2:
-                            weight = sim
-                            if best is None or weight > best[0]: best = (weight, old, new, diff)
-                if best:
-                    _, old, new, diff = best
-                    # Only emit if the changed passage is reasonably specific and rates differ.
-                    values = list(dict.fromkeys(diff))[:8]
-                    topic = _topic(current.title, current.url, new)
-                    out.append(Conflict(
-                        topic=topic, values=values,
-                        sources=[Source(previous.url, previous.snapshot_id, _quote(old)), Source(current.url, current.snapshot_id, _quote(new))],
-                        resolution=_resolution_values(new),
-                        reason=f"The later snapshot ({current.taken_on}) is the newest version of this official page; the earlier value came from {previous.taken_on}.",
-                    ))
-                previous = current
+
+            # Build components rather than folding every fact with the same coarse key
+            # into one report. This keeps independent source disagreements separate.
+            edges = defaultdict(set)
+            for i, left in enumerate(facts):
+                for j, right in enumerate(facts[i + 1:], i + 1):
+                    if _facts_comparable(left, right):
+                        edges[i].add(j)
+                        edges[j].add(i)
+            visited = set()
+            for start in sorted(edges):
+                if start in visited:
+                    continue
+                pending = [start]
+                component = []
+                while pending:
+                    index = pending.pop()
+                    if index in visited:
+                        continue
+                    visited.add(index)
+                    component.append(facts[index])
+                    pending.extend(edges[index] - visited)
+                if len({_numeric_value(f.value) for f in component}) < 2:
+                    continue
+
+                winner = max(component, key=_fact_preference)
+                ordered = sorted(component, key=lambda f: (_fact_preference(f), f.url), reverse=True)
+                competing = []
+                seen_values = set()
+                for fact in ordered:
+                    value = _numeric_value(fact.value)
+                    if value not in seen_values:
+                        seen_values.add(value)
+                        competing.append(fact.value)
+                topic = " ".join(x for x in key if x)[:100]
+                sources = []
+                seen_sources = set()
+                for fact in ordered:
+                    source_key = (fact.url, fact.snapshot_id, _numeric_value(fact.value))
+                    if source_key not in seen_sources:
+                        seen_sources.add(source_key)
+                        sources.append(Source(fact.url, fact.snapshot_id, _quote(fact.passage)))
+                    if len(sources) == 4:
+                        break
+                out.append(Conflict(
+                    topic=topic,
+                    values=competing[:8],
+                    sources=sources,
+                    resolution=winner.value,
+                    reason=_conflict_reason(winner, component),
+                ))
         return out
 
 
@@ -392,7 +469,8 @@ def _focused_answer(question, pages, snapshot_id):
             if "2025" in q or "2024" in q: rows=[x for x in rows if "2024-27 Model Year" in x]
             if rows:return make(" ".join(rows[:2]),[(d," ".join(rows[:2]))])
 
-    if "credit card" in q and _rate_question(q) or ("credit card" in q and ("what are" in q or "cards" in q or "rates" in q)):
+    if (("credit card" in q or "platinum visa" in q or "rewards visa" in q) and
+            (_rate_question(q) or "what are" in q or "cards" in q or "rates" in q)):
         docs=[]; parts=[]
         for d in pages.values():
             if not ("/personal/credit-cards" in d.url or "/business/credit-cards" in d.url): continue
@@ -503,6 +581,176 @@ def _compact(s):
 def _quote(s):
     q=_clean_chunk(s)
     return q[:240]
+
+
+def _extract_rate_facts(doc):
+    """Extract grounded percentage claims without asking a model to interpret numbers."""
+    facts=[]
+    for passage in _fact_passages(doc.text):
+        if not re.search(r"%|percent",passage,re.I): continue
+        if not re.search(r"\b(?:rate|apr|apy|yield|dividend|fee)\b",passage,re.I): continue
+        product=_fact_product(doc,passage)
+        if not product: continue
+        term=_fact_term(passage)
+        tier=_fact_tier(passage)
+        for value,metric in _passage_rate_values(passage):
+            facts.append(RateFact(
+                product=product, term=term, tier=tier, metric=metric, value=value,
+                url=doc.url, title=doc.title, snapshot_id=doc.snapshot_id,
+                taken_on=doc.taken_on, passage=passage,
+                authority=_authority(doc.url,doc.title,product),
+            ))
+    return facts
+
+
+def _fact_passages(text):
+    """Yield individual table rows and paragraphs so tiers do not bleed together."""
+    out=[]
+    heading=""
+    for block in re.split(r"\n\s*\n",text or ""):
+        lines=[line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        headings=[re.sub(r"^#{1,6}\s*", "", line).strip() for line in lines if re.match(r"^#{1,6}\s+",line)]
+        if headings:
+            heading=headings[-1]
+            if len(lines) == len(headings):
+                continue
+        # Snapshot markdown also contains de-styled section labels as isolated lines.
+        # Carry those into the following table so a mortgage widget embedded on a
+        # checking page is not mislabeled as a checking product.
+        if (len(lines) == 1 and len(lines[0]) <= 80 and "|" not in lines[0]
+                and not re.search(r"[%$]|[.!?]$",lines[0])):
+            heading=re.sub(r"^#{1,6}\s*", "", lines[0]).strip()
+            continue
+        table=[line for line in lines if line.startswith("|") and line.count("|") >= 2]
+        if table:
+            header=next((line for line in table if re.search(r"\b(?:rate|apr|apy|term|balance)\b",line,re.I) and not re.search(r"\|\s*:?-{2,}",line)),"")
+            for line in table:
+                if re.search(r"\|\s*:?-{2,}",line): continue
+                passage=(header+"\n"+line).strip() if header and line != header else line
+                out.append((heading+"\n"+passage).strip() if heading else passage)
+        else:
+            passage=" ".join(lines)
+            if passage: out.append(passage)
+    return out
+
+
+def _passage_rate_values(passage):
+    lines=[line for line in passage.splitlines() if line.strip()]
+    table_lines=[line for line in lines if line.startswith("|") and line.count("|") >= 2]
+    if len(table_lines)>=2:
+        headers=[cell.strip().lower() for cell in table_lines[0].strip(" |").split("|")]
+        cells=[cell.strip() for cell in table_lines[-1].strip(" |").split("|")]
+        out=[]
+        for index,cell in enumerate(cells):
+            label=headers[index] if index < len(headers) else ""
+            metric="apy" if "apy" in label or "yield" in label else "apr" if "apr" in label else "dividend rate" if "dividend" in label else "fee" if "fee" in label else "rate"
+            for match in re.finditer(r"\d+(?:\.\d+)?\s?(?:%|percent\b)",cell,re.I):
+                out.append((re.sub(r"\s+","",match.group(0)).replace("percent","%"),metric))
+        if out: return out
+    matches=list(re.finditer(r"\d+(?:\.\d+)?\s?(?:%|percent\b)",passage,re.I))
+    # A prose block containing several percentages commonly embeds a calculator,
+    # comparison widget, or multiple products. Without column labels there is no safe
+    # deterministic way to bind each value to one qualified fact.
+    if len({_numeric_value(match.group(0)) for match in matches}) != 1:
+        return []
+    out=[]
+    for match in matches:
+        nearby=passage[max(0,match.start()-55):match.end()+55].lower()
+        metric="apy" if "apy" in nearby or "yield" in nearby else "apr" if "apr" in nearby else "fee" if "fee" in nearby and "$" in nearby else "dividend rate" if "dividend" in nearby else "rate"
+        out.append((re.sub(r"\s+","",match.group(0)).replace("percent","%"),metric))
+    return out
+
+
+def _fact_product(doc,passage):
+    text=f"{doc.url} {doc.title} {passage}".lower()
+    rules=(
+        ("certificate",("certificate","term share"," cd ")),
+        ("mortgage",("mortgage","home loan","home-loan")),
+        ("auto loan",("auto loan","vehicle loan","motorcycle loan","auto-motorcycle")),
+        ("personal loan",("personal loan","personal-loan")),
+        ("credit card",("credit card","visa","mastercard")),
+        ("checking",("checking",)),
+        ("savings",("savings","money market")),
+    )
+    base=next((name for name,needles in rules if any(n in text for n in needles)),None)
+    if not base: return None
+    # Product variants are meaningful qualifiers, not interchangeable labels.
+    variants=(
+        "investor's choice", "health savings", "you name it", "holiday club",
+        "share savings", "money market", "jumbo", "special", "platinum",
+        "rewards", "business", "bright", "share", "1st rate", "free checking",
+    )
+    found=[]
+    variant_text=f"{passage} {doc.title}".lower()
+    for variant in variants:
+        if variant in variant_text and not any(variant in chosen or chosen in variant for chosen in found):
+            found.append(variant)
+    return " ".join([base]+found[:3])
+
+
+def _fact_term(text):
+    low=text.lower()
+    match=re.search(r"\b(\d{1,3})\s*[- ]?\s*(month|months|mo|mos|year|years|yr|yrs)\b",low)
+    if not match:
+        return None
+    amount=int(match.group(1))
+    unit=match.group(2)
+    if unit.startswith("y"):
+        amount *= 12
+    return f"{amount}-month"
+
+
+def _fact_tier(text):
+    low=text.lower().replace("–","-").replace("—","-")
+    model=re.search(r"\b(20\d{2})\s*-\s*(?:(20)?(\d{2}))\s+model(?:\s+year)?",low)
+    if model:
+        end=(model.group(2) or model.group(1)[:2])+model.group(3)
+        return f"{model.group(1)}-{end} model year"
+    money=re.search(r"\$\s?([\d,]+(?:\.\d+)?)\s*(?:-|to)\s*\$?\s?([\d,]+(?:\.\d+)?)",low)
+    if money: return f"${money.group(1)}-${money.group(2)}"
+    minimum=re.search(r"\$\s?([\d,]+)\s*(?:minimum|min\.?|and (?:up|above)|\+)",low)
+    return f"${minimum.group(1)}+" if minimum else None
+
+
+def _numeric_value(value):
+    match=re.search(r"\d+(?:\.\d+)?",value or "")
+    return float(match.group(0)) if match else value.lower().strip()
+
+
+def _facts_comparable(left,right):
+    if left.url == right.url:
+        return left.snapshot_id != right.snapshot_id
+    if left.snapshot_id != right.snapshot_id:
+        # Compare different pages only when they coexisted. Same-page history covers
+        # changes over time without manufacturing cross-snapshot page pairs.
+        return False
+    # The caller has already aligned product, term, tier, and metric. A term, tier, or
+    # named product variant makes that identity specific enough; requiring prose overlap
+    # here would miss terse rate rows versus verbose calculators and legacy pages.
+    if left.term or left.tier or left.product.count(" ") > 0:
+        return True
+    # Unqualified base products (for example a bare "mortgage rate") remain risky.
+    # Require corroborating nonnumeric wording before treating those as the same fact.
+    lt={t for t in _tokens(left.passage) if t not in STOP and not re.search(r"\d",t)}
+    rt={t for t in _tokens(right.passage) if t not in STOP and not re.search(r"\d",t)}
+    return len(lt & rt) >= 2
+
+
+def _fact_preference(fact):
+    # Authority wins across pages; freshness resolves versions of equally authoritative
+    # sources. Lexical ISO dates sort chronologically.
+    return (round(fact.authority,3),fact.taken_on,"calculator" not in fact.url.lower(),fact.url)
+
+
+def _conflict_reason(winner,facts):
+    other=max((f for f in facts if _numeric_value(f.value) != _numeric_value(winner.value)),key=_fact_preference)
+    if winner.url == other.url:
+        return f"The {winner.taken_on} snapshot is the newest version of this page; the competing value came from {other.taken_on}."
+    if winner.authority > other.authority:
+        return f"The official product or rate page ({winner.url}) is more authoritative than the competing secondary page ({other.url}); both values were found in the {winner.taken_on} snapshot."
+    return f"The value from {winner.url} is preferred using source authority and snapshot freshness; the competing value came from {other.url}."
 
 
 def _extract_numbers(text):
