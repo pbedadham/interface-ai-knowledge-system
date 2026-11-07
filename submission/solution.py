@@ -113,7 +113,6 @@ class Knowledge:
         focused = _focused_answer(question, pages, snap[1])
         if focused is not None:
             return focused
-        preferred_facts, rejected_facts = self._fact_guidance(question, snap[1])
         q = _tokens(question)
         expanded = set(q)
         for t in list(q): expanded.update(ALIASES.get(t, ()))
@@ -141,9 +140,6 @@ class Knowledge:
                 if broad and _looks_like_rate_table(chunk): score *= 1.25
                 if _is_historical(chunk): score *= 0.72
                 score += _evidence_boost(chunk, question)
-                chunk_values={_numeric_value(v) for v in _extract_values(chunk)}
-                if any(url == d.url and value in chunk_values for url,value in preferred_facts): score *= 1.35
-                if any(url == d.url and value in chunk_values for url,value in rejected_facts): score *= 0.55
                 candidates.append((score, d, chunk))
         candidates.sort(key=lambda x: (-x[0], x[1].url, x[2]))
         if not candidates or candidates[0][0] < 1.3:
@@ -195,28 +191,6 @@ class Knowledge:
             if d and all(s.url != d.url for s in sources): sources.append(Source(d.url,d.snapshot_id,_quote(d.text[:300])))
         note = self._conflict_note(question, primary, primary_chunk, as_of)
         return Answer(text=text[:1800], sources=sources, confident=True, conflict_note=note)
-
-    def _fact_guidance(self, question, snapshot_id):
-        """Share conflict-resolution decisions with retrieval without generating text."""
-        qtokens=set(_tokens(question))-STOP
-        relevant=[]
-        for fact in self.facts:
-            if fact.snapshot_id != snapshot_id: continue
-            ftokens=set(_tokens(" ".join(x for x in (fact.product,fact.term,fact.tier,fact.metric) if x)))
-            if not ftokens or len(qtokens & ftokens) < min(2,len(ftokens)): continue
-            if fact.term and re.search(r"\b\d+\s*[- ]?(?:month|year)",question,re.I) and fact.term.split("-")[0] not in question:
-                continue
-            relevant.append(fact)
-        groups=defaultdict(list)
-        for fact in relevant:
-            groups[(fact.product,fact.term,fact.tier,fact.metric)].append(fact)
-        preferred=set(); rejected=set()
-        for facts in groups.values():
-            if len({_numeric_value(f.value) for f in facts}) < 2: continue
-            winner=max(facts,key=_fact_preference)
-            preferred.add((winner.url,_numeric_value(winner.value)))
-            rejected.update((f.url,_numeric_value(f.value)) for f in facts if _numeric_value(f.value) != _numeric_value(winner.value))
-        return preferred,rejected
 
     def _conflict_note(self, question, primary, chunk, as_of):
         q = _tokens(question)
